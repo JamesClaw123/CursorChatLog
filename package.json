@@ -1,7 +1,7 @@
 {
   "name": "cursor-browser",
   "version": "0.1.0",
-  "description": "Read-only local Cursor conversation history scanner.",
+  "description": "Local Cursor conversation history browser.",
   "type": "module",
   "bin": {
     "cursor-browser": "./src/cli.js"
@@ -9,7 +9,9 @@
   "scripts": {
     "scan": "node ./src/cli.js scan",
     "list": "node ./src/cli.js list",
-    "export": "node ./src/cli.js export"
+    "export": "node ./src/cli.js export",
+    "web": "node ./src/cli.js web",
+    "delete": "node ./src/cli.js delete"
   },
   "engines": {
     "node": ">=20"

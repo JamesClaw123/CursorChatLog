@@ -1,6 +1,13 @@
 #!/usr/bin/env node
 
-import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
@@ -67,6 +74,25 @@ function main() {
     return;
   }
 
+  if (command === "delete") {
+    const ids = args._.slice(1).flatMap((value) => value.split(",")).filter(Boolean);
+    if (!ids.length) fail("Missing composerId. Example: node ./src/cli.js delete <composerId> --confirm");
+    const dryRun = !args.confirm;
+    const result = deleteRecords(cursorUserDir, ids, { dryRun });
+    printDeleteResult(result);
+    if (dryRun) {
+      console.log("\nDry run only. Add --confirm to delete these records after reviewing the plan.");
+    }
+    return;
+  }
+
+  if (command === "web") {
+    import("./server.js")
+      .then(({ startServer }) => startServer({ cursorUserDir, port: Number(args.port || 4317) }))
+      .catch((error) => fail(error.stack || error.message));
+    return;
+  }
+
   fail(`Unknown command: ${command}`);
 }
 
@@ -83,7 +109,7 @@ function parseArgs(argv) {
     const key = rawKey.trim();
     if (inlineValue !== undefined) {
       parsed[key] = inlineValue;
-    } else if (["help", "raw"].includes(key)) {
+    } else if (["help", "raw", "confirm"].includes(key)) {
       parsed[key] = true;
     } else {
       parsed[key] = argv[i + 1];
@@ -93,7 +119,7 @@ function parseArgs(argv) {
   return parsed;
 }
 
-function loadCursorStore(cursorUserDir, options = {}) {
+export function loadCursorStore(cursorUserDir = DEFAULT_CURSOR_USER_DIR, options = {}) {
   if (!existsSync(cursorUserDir)) {
     fail(`Cursor user directory does not exist: ${cursorUserDir}`);
   }
@@ -277,6 +303,13 @@ function querySqliteJson(dbPath, sql) {
   }
 }
 
+function execSqlite(dbPath, sql) {
+  execFileSync("sqlite3", [dbPath, sql], {
+    encoding: "utf8",
+    maxBuffer: 1024 * 1024 * 128,
+  });
+}
+
 function normalizeComposerHeaders(headers, defaults) {
   return headers
     .filter((header) => header && header.composerId)
@@ -360,7 +393,7 @@ function parseJson(text) {
   }
 }
 
-function filterRecords(records, query) {
+export function filterRecords(records, query) {
   if (!query) return records;
   const needle = query.toLowerCase();
   return records.filter((record) => searchableText(record).includes(needle));
@@ -384,7 +417,7 @@ function searchableText(record) {
     .toLowerCase();
 }
 
-function findRecord(records, id) {
+export function findRecord(records, id) {
   return records.find((record) => record.composerId === id || record.composerId?.startsWith(id));
 }
 
@@ -445,7 +478,7 @@ function printRecord(record, raw) {
   }
 }
 
-function renderMarkdown(records) {
+export function renderMarkdown(records) {
   const lines = ["# Cursor History Export", ""];
   for (const record of records) {
     lines.push(`## ${escapeMarkdown(record.name || "(untitled)")}`);
@@ -454,10 +487,10 @@ function renderMarkdown(records) {
     lines.push(`- updated: ${formatTime(record.lastUpdatedAt || record.createdAt)}`);
     if (record.workspacePath) lines.push(`- workspace: \`${record.workspacePath}\``);
     if (record.subtitle) lines.push(`- subtitle: ${escapeMarkdown(record.subtitle)}`);
-  if (Number.isFinite(record.conversationHeaderCount)) {
+    if (Number.isFinite(record.conversationHeaderCount)) {
       lines.push(`- cached bubble headers: ${record.conversationHeaderCount}`);
     }
-  if (Number.isFinite(record.bubbleCount)) {
+    if (Number.isFinite(record.bubbleCount)) {
       lines.push(`- cached full bubbles: ${record.bubbleCount}`);
     }
     if (record.bubbleLoadMode === "matching") {
@@ -498,6 +531,180 @@ function extractConversationText(record) {
     .filter((entry) => entry.text);
 }
 
+export function recordSummary(record) {
+  return {
+    composerId: record.composerId,
+    name: record.name || "(untitled)",
+    subtitle: record.subtitle || "",
+    createdAt: formatTime(record.createdAt),
+    lastUpdatedAt: formatTime(record.lastUpdatedAt || record.createdAt),
+    mode: [record.unifiedMode, record.forceMode].filter(Boolean).join("/"),
+    status: record.status || "",
+    workspacePath: record.workspacePath || "",
+    bubbleCount: record.bubbleCount || 0,
+    conversationHeaderCount: record.conversationHeaderCount || 0,
+    textPreview: firstTextPreview(record),
+  };
+}
+
+export function recordDetails(record) {
+  return {
+    ...recordSummary(record),
+    messages: extractConversationText(record),
+  };
+}
+
+function firstTextPreview(record) {
+  const first = extractConversationText(record).find((entry) => entry.text);
+  if (!first) return record.subtitle || "";
+  return first.text.replace(/\s+/g, " ").trim().slice(0, 180);
+}
+
+export function deleteRecords(cursorUserDir = DEFAULT_CURSOR_USER_DIR, ids, options = {}) {
+  const requestedIds = [...new Set(ids.map((id) => id.trim()).filter(Boolean))];
+  if (!requestedIds.length) fail("No composer ids provided.");
+
+  const store = loadCursorStore(cursorUserDir, { bubbleMode: "count" });
+  const records = requestedIds.map((id) => {
+    const record = findRecord(store.records, id);
+    if (!record) return { requestedId: id, missing: true };
+    return record;
+  });
+  const exactIds = records.filter((record) => !record.missing).map((record) => record.composerId);
+  const missingIds = records.filter((record) => record.missing).map((record) => record.requestedId);
+  const backupDir = path.resolve(options.backupDir || path.join(process.cwd(), "backups", timestampForFile()));
+  const operations = [];
+
+  if (store.globalDb && existsSync(store.globalDb)) {
+    operations.push(...planGlobalDeletes(store.globalDb, exactIds));
+  }
+  for (const dbPath of store.workspaceDbs) {
+    operations.push(...planWorkspaceDeletes(dbPath, exactIds));
+  }
+
+  const touchedDbs = [...new Set(operations.filter((op) => op.writes).map((op) => op.dbPath))];
+  if (!options.dryRun && touchedDbs.length) {
+    mkdirSync(backupDir, { recursive: true });
+    for (const dbPath of touchedDbs) backupSqliteFiles(dbPath, backupDir);
+    for (const operation of operations) {
+      if (operation.writes) execSqlite(operation.dbPath, operation.sql);
+    }
+  }
+
+  return {
+    dryRun: Boolean(options.dryRun),
+    requestedIds,
+    deletedIds: exactIds,
+    missingIds,
+    backupDir: !options.dryRun && touchedDbs.length ? backupDir : "",
+    plannedBackupDir: options.dryRun && touchedDbs.length ? backupDir : "",
+    operations: operations.map(({ dbPath, description, count, writes }) => ({
+      dbPath,
+      description,
+      count,
+      writes,
+    })),
+  };
+}
+
+function planGlobalDeletes(dbPath, ids) {
+  const operations = [];
+  for (const id of ids) {
+    const composerKey = `composerData:${id}`;
+    const composerRows = querySqliteJson(
+      dbPath,
+      `select count(*) as count from cursorDiskKV where key = '${sqlString(composerKey)}';`,
+    );
+    const composerCount = composerRows[0]?.count || 0;
+    operations.push({
+      dbPath,
+      description: `Delete global composerData for ${id}`,
+      count: composerCount,
+      writes: composerCount > 0,
+      sql: `delete from cursorDiskKV where key = '${sqlString(composerKey)}';`,
+    });
+
+    const bubbleRows = querySqliteJson(
+      dbPath,
+      `select count(*) as count from cursorDiskKV where key like 'bubbleId:${sqlString(id)}:%';`,
+    );
+    const bubbleCount = bubbleRows[0]?.count || 0;
+    operations.push({
+      dbPath,
+      description: `Delete ${bubbleCount} cached bubbles for ${id}`,
+      count: bubbleCount,
+      writes: bubbleCount > 0,
+      sql: `delete from cursorDiskKV where key like 'bubbleId:${sqlString(id)}:%';`,
+    });
+  }
+
+  const rows = querySqliteJson(
+    dbPath,
+    "select cast(value as text) as value from ItemTable where key = 'composer.composerHeaders';",
+  );
+  const payload = parseJson(rows[0]?.value);
+  if (payload?.allComposers) {
+    const before = payload.allComposers.length;
+    payload.allComposers = payload.allComposers.filter((header) => !ids.includes(header.composerId));
+    const removed = before - payload.allComposers.length;
+    operations.push({
+      dbPath,
+      description: "Remove records from global composer headers",
+      count: removed,
+      writes: removed > 0,
+      sql: `update ItemTable set value = '${sqlString(JSON.stringify(payload))}' where key = 'composer.composerHeaders';`,
+    });
+  }
+  return operations;
+}
+
+function planWorkspaceDeletes(dbPath, ids) {
+  const rows = querySqliteJson(
+    dbPath,
+    "select cast(value as text) as value from ItemTable where key = 'composer.composerData';",
+  );
+  const payload = parseJson(rows[0]?.value);
+  if (!payload?.allComposers) return [];
+  const before = payload.allComposers.length;
+  payload.allComposers = payload.allComposers.filter((header) => !ids.includes(header.composerId));
+  const removed = before - payload.allComposers.length;
+  return [{
+    dbPath,
+    description: "Remove records from workspace composer data",
+    count: removed,
+    writes: removed > 0,
+    sql: `update ItemTable set value = '${sqlString(JSON.stringify(payload))}' where key = 'composer.composerData';`,
+  }];
+}
+
+function backupSqliteFiles(dbPath, backupDir) {
+  for (const suffix of ["", "-wal", "-shm"]) {
+    const source = `${dbPath}${suffix}`;
+    if (!existsSync(source)) continue;
+    const safeName = source.replaceAll("/", "__").replace(/^__/, "");
+    copyFileSync(source, path.join(backupDir, safeName));
+  }
+}
+
+function printDeleteResult(result) {
+  console.log(`${result.dryRun ? "Planned" : "Deleted"} records: ${result.deletedIds.length}`);
+  if (result.deletedIds.length) console.log(`Ids: ${result.deletedIds.join(", ")}`);
+  if (result.missingIds.length) console.log(`Missing ids: ${result.missingIds.join(", ")}`);
+  if (result.backupDir) console.log(`Backup dir: ${result.backupDir}`);
+  if (result.plannedBackupDir) console.log(`Planned backup dir: ${result.plannedBackupDir}`);
+  for (const operation of result.operations.filter((op) => op.count > 0)) {
+    console.log(`- ${operation.description}: ${operation.count}`);
+  }
+}
+
+function sqlString(value) {
+  return String(value).replaceAll("'", "''");
+}
+
+function timestampForFile() {
+  return new Date().toISOString().replace(/[:.]/g, "-");
+}
+
 function findText(value, depth = 0) {
   if (depth > 6 || value == null) return "";
   if (typeof value === "string") return value.length > 2 ? value : "";
@@ -536,13 +743,19 @@ Usage:
   node ./src/cli.js list [--query <text>] [--limit <n>] [--cursor-dir <path>]
   node ./src/cli.js show <composerId> [--raw] [--cursor-dir <path>]
   node ./src/cli.js export [--query <text>] [--out <file>] [--cursor-dir <path>]
+  node ./src/cli.js delete <composerId[,composerId]> [--confirm] [--cursor-dir <path>]
+  node ./src/cli.js web [--port <port>] [--cursor-dir <path>]
 
 Commands:
   scan    Show discovered Cursor storage counts.
   list    List local composer/chat records.
   show    Show one record by full or prefix composerId.
   export  Export matching records to Markdown.
+  delete  Delete specific local records. Defaults to dry run; requires --confirm to write.
+  web     Start the local Web UI.
 `);
 }
 
-main();
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main();
+}
